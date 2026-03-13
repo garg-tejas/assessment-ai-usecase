@@ -1,0 +1,19 @@
+[project]
+name = "neostats"
+version = "0.1.0"
+description = "Research assistant chatbot with RAG and live web search"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "beautifulsoup4>=4.14.3",
+    "exa-py>=1.0.0",
+    "faiss-cpu>=1.13.2",
+    "langchain>=1.2.12",
+    "langchain-community>=0.4.1",
+    "langchain-core>=1.2.18",
+    "langchain-google-genai>=4.2.1",
+    "langchain-openai>=1.1.11",
+    "pypdf>=6.8.0",
+    "python-dotenv>=1.0.0",
+    "streamlit>=1.55.0",
+]

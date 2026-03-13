@@ -1,182 +1,357 @@
-import streamlit as st
+"""
+app.py - NeoStats Research Assistant
+
+Streamlit UI. Combines RAG, live web search, and multi-provider LLM support.
+API keys are read from .env - configure them before running.
+"""
+
 import os
 import sys
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
-from models.llm import get_chatgroq_model
+import tempfile
+import logging
+
+import streamlit as st
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
+
+sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
+
+from config.config import (
+    LLM_API_KEY,
+    LLM_BASE_URL,
+    LLM_MODEL,
+    EMBEDDING_API_KEY,
+    EXA_API_KEY,
+    PROVIDER_PRESETS,
+)
+from models.llm import get_llm_model
+from models.embeddings import get_doc_embeddings, get_query_embeddings
+from utils.rag import (
+    load_documents,
+    build_vectorstore,
+    load_vectorstore,
+    add_to_vectorstore,
+    query_vectorstore,
+)
+from utils.search import web_search, extract_urls_from_prompt
+
+logging.basicConfig(level=logging.WARNING)
+logger = logging.getLogger(__name__)
+
+SYSTEM_PROMPT = {
+    "Concise": (
+        "You are a research assistant. Answer in 2-3 sentences - be direct and skip preamble. "
+        "Use the provided context when relevant and cite sources inline."
+    ),
+    "Detailed": (
+        "You are a research assistant. Give a thorough, well-structured answer. "
+        "Use headings or bullet points where helpful, include examples, and cite sources. "
+        "Use the provided context when relevant."
+    ),
+}
 
 
-def get_chat_response(chat_model, messages, system_prompt):
-    """Get response from the chat model"""
+def get_response(llm, history: list, mode: str, rag_ctx: str, web_ctx: str) -> str:
     try:
-        # Prepare messages for the model
-        formatted_messages = [SystemMessage(content=system_prompt)]
-        
-        # Add conversation history
-        for msg in messages:
+        # Build context block to prepend to the system prompt
+        ctx_parts = []
+        if rag_ctx:
+            ctx_parts.append(f"--- Documents ---\n{rag_ctx}")
+        if web_ctx:
+            ctx_parts.append(f"--- Web Search ---\n{web_ctx}")
+
+        system = SYSTEM_PROMPT[mode]
+        if ctx_parts:
+            system += "\n\n" + "\n\n".join(ctx_parts)
+
+        messages: list[BaseMessage] = [SystemMessage(content=system)]
+        for msg in history:
             if msg["role"] == "user":
-                formatted_messages.append(HumanMessage(content=msg["content"]))
+                messages.append(HumanMessage(content=msg["content"]))
             else:
-                formatted_messages.append(AIMessage(content=msg["content"]))
-        
-        # Get response from model
-        response = chat_model.invoke(formatted_messages)
-        return response.content
-    
+                messages.append(AIMessage(content=msg["content"]))
+
+        return llm.invoke(messages).content
     except Exception as e:
-        return f"Error getting response: {str(e)}"
+        logger.error("LLM error: %s", e)
+        return f"Something went wrong: {e}"
 
-def instructions_page():
-    """Instructions and setup page"""
-    st.title("The Chatbot Blueprint")
-    st.markdown("Welcome! Follow these instructions to set up and use the chatbot.")
-    
-    st.markdown("""
-    ## 🔧 Installation
-                
-    
-    First, install the required dependencies: (Add Additional Libraries base don your needs)
-    
-    ```bash
-    pip install -r requirements.txt
-    ```
-    
-    ## API Key Setup
-    
-    You'll need API keys from your chosen provider. Get them from:
-    
-    ### OpenAI
-    - Visit [OpenAI Platform](https://platform.openai.com/api-keys)
-    - Create a new API key
-    - Set the variables in config
-    
-    ### Groq
-    - Visit [Groq Console](https://console.groq.com/keys)
-    - Create a new API key
-    - Set the variables in config
-    
-    ### Google Gemini
-    - Visit [Google AI Studio](https://aistudio.google.com/app/apikey)
-    - Create a new API key
-    - Set the variables in config
-    
-    ## 📝 Available Models
-    
-    ### OpenAI Models
-    Check [OpenAI Models Documentation](https://platform.openai.com/docs/models) for the latest available models.
-    Popular models include:
-    - `gpt-4o` - Latest GPT-4 Omni model
-    - `gpt-4o-mini` - Faster, cost-effective version
-    - `gpt-3.5-turbo` - Fast and affordable
-    
-    ### Groq Models
-    Check [Groq Models Documentation](https://console.groq.com/docs/models) for available models.
-    Popular models include:
-    - `llama-3.1-70b-versatile` - Large, powerful model
-    - `llama-3.1-8b-instant` - Fast, smaller model
-    - `mixtral-8x7b-32768` - Good balance of speed and capability
-    
-    ### Google Gemini Models
-    Check [Gemini Models Documentation](https://ai.google.dev/gemini-api/docs/models/gemini) for available models.
-    Popular models include:
-    - `gemini-1.5-pro` - Most capable model
-    - `gemini-1.5-flash` - Fast and efficient
-    - `gemini-pro` - Standard model
-    
-    ## How to Use
-    
-    1. **Go to the Chat page** (use the navigation in the sidebar)
-    2. **Start chatting** once everything is configured!
-    
-    ## Tips
-    
-    - **System Prompts**: Customize the AI's personality and behavior
-    - **Model Selection**: Different models have different capabilities and costs
-    - **API Keys**: Can be entered in the app or set as environment variables
-    - **Chat History**: Persists during your session but resets when you refresh
-    
-    ## Troubleshooting
-    
-    - **API Key Issues**: Make sure your API key is valid and has sufficient credits
-    - **Model Not Found**: Check the provider's documentation for correct model names
-    - **Connection Errors**: Verify your internet connection and API service status
-    
-    ---
-    
-    Ready to start chatting? Navigate to the **Chat** page using the sidebar! 
-    """)
 
-def chat_page():
-    """Main chat interface page"""
-    st.title("🤖 AI ChatBot")
-    
-    # Get configuration from environment variables or session state
-    # Default system prompt
-    system_prompt = ""
-    
-    
-    # Determine which provider to use based on available API keys
-    chat_model = get_chatgroq_model()
-    
-    # Initialize chat history
+def get_vectorstore(embedding_key: str):
+    """Return vectorstore from session state or load from disk."""
+    if "vectorstore" in st.session_state:
+        return st.session_state.vectorstore
+    if not embedding_key:
+        return None
+    try:
+        vs = load_vectorstore(get_query_embeddings(embedding_key))
+        if vs:
+            st.session_state.vectorstore = vs
+        return vs
+    except Exception as e:
+        logger.warning("Could not load vectorstore: %s", e)
+        return None
+
+
+def index_files(files, embedding_key: str):
+    """Index uploaded files into the FAISS store."""
+    with st.spinner("Indexing..."):
+        try:
+            doc_emb = get_doc_embeddings(embedding_key)
+            with tempfile.TemporaryDirectory() as tmp:
+                paths = []
+                for f in files:
+                    p = os.path.join(tmp, f.name)
+                    with open(p, "wb") as fp:
+                        fp.write(f.read())
+                    paths.append(p)
+                docs = load_documents(paths)
+
+            existing = get_vectorstore(embedding_key)
+            if existing:
+                vs = add_to_vectorstore(existing, docs, doc_emb)
+            else:
+                vs = build_vectorstore(docs, doc_emb)
+
+            st.session_state.vectorstore = vs
+            st.success(f"Indexed {len(files)} file(s).")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Indexing failed: {e}")
+
+
+def clear_index():
+    import shutil
+
+    try:
+        if os.path.exists("faiss_index"):
+            shutil.rmtree("faiss_index")
+        st.session_state.pop("vectorstore", None)
+        st.success("Index cleared.")
+        st.rerun()
+    except Exception as e:
+        st.error(f"Could not clear index: {e}")
+
+
+def sidebar():
+    """Render sidebar and return runtime config."""
+    with st.sidebar:
+        st.title("Research Assistant")
+        st.caption("Configure your session below.")
+        st.divider()
+
+        # Provider picker - switches base_url + model automatically
+        st.subheader("LLM Provider")
+        provider = st.selectbox("Provider", list(PROVIDER_PRESETS.keys()) + ["Custom"])
+
+        if provider != "Custom":
+            preset = PROVIDER_PRESETS[provider]
+            api_key = preset["api_key"]
+            base_url = preset["base_url"]
+            model = preset["model"]
+        else:
+            api_key = LLM_API_KEY
+            base_url = LLM_BASE_URL
+            model = LLM_MODEL
+
+        # Show which model is active; let user override if needed
+        active_model = st.text_input("Model", value=model)
+
+        # Warn only about keys relevant to the active configuration
+        missing = []
+        if not api_key:
+            missing.append(
+                "LLM_API_KEY"
+                if provider == "Custom"
+                else f"{provider.upper().replace('.', '').replace(' ', '_')}_API_KEY"
+            )
+        if not EMBEDDING_API_KEY:
+            missing.append("EMBEDDING_API_KEY")
+        if not EXA_API_KEY:
+            missing.append("EXA_API_KEY")
+
+        if missing:
+            st.warning(f"Missing in .env: {', '.join(missing)}")
+
+        st.divider()
+
+        # Response style
+        st.subheader("Response Mode")
+        mode = st.radio("Style", ["Detailed", "Concise"], index=0)
+
+        st.divider()
+
+        # Web search toggle
+        st.subheader("Web Search")
+        web_enabled = st.checkbox(
+            "Search the web on every query",
+            help="Also triggers automatically when you paste a URL in your message.",
+        )
+
+        st.divider()
+
+        # Document upload for RAG
+        st.subheader("Knowledge Base")
+        indexed = os.path.exists(os.path.join("faiss_index", "index.faiss"))
+        if indexed:
+            st.success("Index ready.")
+        else:
+            st.info("No documents indexed yet.")
+
+        uploads = st.file_uploader(
+            "Upload files", type=["pdf", "txt", "md"], accept_multiple_files=True
+        )
+        if st.button("Index Documents", use_container_width=True):
+            if not EMBEDDING_API_KEY:
+                st.error("EMBEDDING_API_KEY not set in .env.")
+            elif not uploads:
+                st.warning("Select files first.")
+            else:
+                index_files(uploads, EMBEDDING_API_KEY)
+
+        if st.button("Clear Index", use_container_width=True):
+            clear_index()
+
+        st.divider()
+
+        if st.button("Clear Chat", use_container_width=True):
+            st.session_state.messages = []
+            st.rerun()
+
+    return {
+        "api_key": api_key,
+        "base_url": base_url,
+        "model": active_model,
+        "mode": mode,
+        "web_enabled": web_enabled,
+    }
+
+
+def chat_page(cfg: dict):
+    st.title("Research Assistant")
+    st.caption("Ask anything - I'll search your documents and the web to answer.")
+
+    # Validate required keys before doing anything
+    if not cfg["api_key"]:
+        st.error("LLM API key is not set. Add it to your .env file and restart.")
+        return
+
+    # Re-use the LLM instance unless the config changed
+    llm_key = (cfg["api_key"], cfg["base_url"], cfg["model"])
+    if st.session_state.get("_llm_key") != llm_key:
+        try:
+            st.session_state.llm = get_llm_model(
+                cfg["api_key"], cfg["base_url"], cfg["model"]
+            )
+            st.session_state["_llm_key"] = llm_key
+        except Exception as e:
+            st.error(f"Could not initialise LLM: {e}")
+            return
+
+    llm = st.session_state.llm
+
     if "messages" not in st.session_state:
         st.session_state.messages = []
-    
-    # Display chat messages
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
-    
-    # Chat input
-    # if chat_model:
-    if prompt := st.chat_input("Type your message here..."):
-        # Add user message to chat history
+
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    if prompt := st.chat_input("Ask a research question..."):
         st.session_state.messages.append({"role": "user", "content": prompt})
-        
-        # Display user message
         with st.chat_message("user"):
             st.markdown(prompt)
-        
-        # Generate and display bot response
+
         with st.chat_message("assistant"):
-            with st.spinner("Getting response..."):
-                response = get_chat_response(chat_model, st.session_state.messages, system_prompt)
+            with st.spinner("Researching..."):
+                # If the user pasted a URL, fetch and index it first
+                urls = extract_urls_from_prompt(prompt)
+                if urls and EMBEDDING_API_KEY:
+                    try:
+                        with st.status(f"Fetching {len(urls)} URL(s)..."):
+                            doc_emb = get_doc_embeddings(EMBEDDING_API_KEY)
+                            url_docs = load_documents(urls)
+                            existing = get_vectorstore(EMBEDDING_API_KEY)
+                            vs = (
+                                add_to_vectorstore(existing, url_docs, doc_emb)
+                                if existing
+                                else build_vectorstore(url_docs, doc_emb)
+                            )
+                            st.session_state.vectorstore = vs
+                    except Exception as e:
+                        st.warning(f"Could not fetch URL(s): {e}")
+
+                # RAG retrieval
+                rag_ctx = ""
+                vs = get_vectorstore(EMBEDDING_API_KEY)
+                if vs:
+                    rag_ctx = query_vectorstore(vs, prompt)
+
+                # Web search - runs when enabled or when URLs were in the prompt
+                web_ctx = ""
+                if (cfg["web_enabled"] or bool(urls)) and EXA_API_KEY:
+                    web_ctx = web_search(prompt, EXA_API_KEY)
+
+                response = get_response(
+                    llm, st.session_state.messages, cfg["mode"], rag_ctx, web_ctx
+                )
                 st.markdown(response)
-        
-        # Add bot response to chat history
+
         st.session_state.messages.append({"role": "assistant", "content": response})
-    else:
-        st.info("🔧 No API keys found in environment variables. Please check the Instructions page to set up your API keys.")
+
+
+def about_page():
+    st.title("About")
+    st.markdown("""
+## NeoStats Research Assistant
+
+A chatbot built for researchers, analysts, and curious people who need answers
+grounded in real sources - not just what the model remembers.
+
+### How it works
+
+1. **Ask a question** - the assistant searches your uploaded documents and/or the web.
+2. **RAG (Retrieval-Augmented Generation)** - relevant passages from your files are
+   retrieved and injected into the context before the LLM responds.
+3. **Exa web search** - when enabled (or when you paste a URL), Exa's neural search
+   fetches live, high-quality sources and adds them to the context.
+4. **Response modes** - switch between Concise (quick 2-3 sentence answers) and
+   Detailed (structured, sourced responses).
+
+### Setup
+
+1. Copy `.env.example` to `.env` and fill in your API keys.
+2. Run with `uv run streamlit run app.py`.
+
+### API keys needed
+
+| Key | Purpose |
+|---|---|
+| `GEMINI_API_KEY` | Gemini LLM |
+| `ZAI_API_KEY` | Z.ai LLM |
+| `EMBEDDING_API_KEY` | Gemini embeddings for RAG (same as `GEMINI_API_KEY`) |
+| `EXA_API_KEY` | Exa web search |
+    """)
+
 
 def main():
     st.set_page_config(
-        page_title="LangChain Multi-Provider ChatBot",
-        page_icon="🤖",
+        page_title="Research Assistant",
+        page_icon="",
         layout="wide",
-        initial_sidebar_state="expanded"
+        initial_sidebar_state="expanded",
     )
-    
-    # Navigation
+
     with st.sidebar:
-        st.title("Navigation")
-        page = st.radio(
-            "Go to:",
-            ["Chat", "Instructions"],
-            index=0
-        )
-        
-        # Add clear chat button in sidebar for chat page
-        if page == "Chat":
-            st.divider()
-            if st.button("🗑️ Clear Chat History", use_container_width=True):
-                st.session_state.messages = []
-                st.rerun()
-    
-    # Route to appropriate page
-    if page == "Instructions":
-        instructions_page()
+        page = st.radio("Page", ["Chat", "About"], label_visibility="collapsed")
+        st.divider()
+
+    cfg = sidebar()
+
     if page == "Chat":
-        chat_page()
+        chat_page(cfg)
+    else:
+        about_page()
+
 
 if __name__ == "__main__":
     main()
